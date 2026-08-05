@@ -4,7 +4,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 
-	"users/actions"
+	"github.com/Ivanvnew75/users/actions"
 )
 
 func main() {
