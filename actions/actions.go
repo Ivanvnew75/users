@@ -9,19 +9,24 @@ package actions
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 
 	"github.com/labstack/echo/v4"
 
+	"github.com/Ivanvnew75/libs/common"
 	"github.com/Ivanvnew75/users/storage"
 )
 
 type Handler struct {
 	Store *storage.Store
+	Log   *slog.Logger
 }
 
-func New(s *storage.Store) *Handler { return &Handler{Store: s} }
+func New(s *storage.Store, log *slog.Logger) *Handler {
+	return &Handler{Store: s, Log: log}
+}
 
 // Register вешает маршруты. Собрано в одном месте, чтобы список ручек
 // сервиса читался за пять секунд.
@@ -182,7 +187,15 @@ func (h *Handler) mapError(c echo.Context, err error) error {
 	case errors.Is(err, storage.ErrConflict):
 		return c.JSON(http.StatusConflict, echo.Map{"error": "user already exists"})
 	default:
-		c.Logger().Errorf("storage error: %v", err)
+		// Детали ошибки — в лог, наружу только общее сообщение.
+		// request_id связывает 500-ку у клиента с этой строкой в логе:
+		// пользователь присылает идентификатор, инженер находит причину
+		// одним запросом, не имея ничего кроме него.
+		h.Log.ErrorContext(c.Request().Context(), "storage error",
+			slog.String("error", err.Error()),
+			slog.String("request_id", common.RequestIDFromContext(c.Request().Context())),
+			slog.String("uri", c.Request().URL.Path),
+		)
 		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "internal error"})
 	}
 }

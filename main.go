@@ -3,72 +3,97 @@ package main
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
 
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+
+	"github.com/Ivanvnew75/libs/common"
 
 	"github.com/Ivanvnew75/users/actions"
 	"github.com/Ivanvnew75/users/config"
 	"github.com/Ivanvnew75/users/storage"
 )
 
+// Заполняются линкером при сборке (-ldflags -X).
+var (
+	version = "dev"
+	commit  = "unknown"
+)
+
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
-		// Фактор 11 (Logs): пишем в stdout/stderr, никаких файлов и ротации.
-		// Сбором занимается окружение, а не приложение.
-		log.Fatalf("config error: %v", err)
+		// До инициализации логгера писать больше нечем. Важно, что это
+		// stderr, а не файл: поток подхватит рантайм (Фактор 11).
+		slog.Error("config error", slog.String("error", err.Error()))
+		os.Exit(1)
 	}
+
+	// Один логгер на весь сервис. service и version добавляются в каждую
+	// запись — без них логи трёх сервисов в общем хранилище неразличимы.
+	logger := common.NewLogger("users", version, cfg.LogFormat, cfg.LogLevel)
+
+	// Имя пода — из Downward API. В логе оно отвечает на вопрос
+	// «это одна реплика сходит с ума или все».
+	if pod := os.Getenv("POD_NAME"); pod != "" {
+		logger = logger.With(slog.String("pod", pod))
+	}
+
+	// slog.SetDefault нужен, чтобы чужой код, пишущий через log.Printf
+	// или slog по умолчанию, тоже попадал в наш JSON, а не в plain text.
+	// Иначе в контейнере снова окажется два формата.
+	slog.SetDefault(logger)
+
+	logger.Info("starting", slog.String("commit", commit))
 
 	ctx := context.Background()
 
 	store, err := storage.New(ctx, cfg.DatabaseURL, cfg.DBMaxConns)
 	if err != nil {
-		log.Fatalf("storage init: %v", err)
+		logger.Error("storage init failed", slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 	defer store.Close()
 
 	e := echo.New()
 	e.HideBanner = true
 	e.HidePort = true
-	e.Use(middleware.Logger())
+
+	// Порядок middleware имеет значение и читается сверху вниз:
+	//   RequestID          — сначала выдать/принять идентификатор,
+	//   PropagateRequestID — положить его в context для исходящих вызовов,
+	//   RequestLogger      — залогировать запрос уже с этим идентификатором,
+	//   Recover            — поймать панику ВНУТРИ логируемого участка,
+	//                        иначе паника не попадёт в лог запроса.
+	e.Use(common.RequestID())
+	e.Use(common.PropagateRequestID())
+	e.Use(common.RequestLogger(logger))
 	e.Use(middleware.Recover())
 
-	actions.New(store).Register(e)
+	actions.New(store, logger).Register(e)
 
-	// Фактор 7 (Port binding): сервис сам открывает порт и является
-	// самодостаточным. Ему не нужен ни Apache с mod_php, ни nginx-обёртка —
-	// снаружи он выглядит как обычный HTTP-бэкенд, и это позволяет
-	// одинаково запускать его локально, в Docker и в Kubernetes.
 	go func() {
 		addr := ":" + cfg.Port
-		log.Printf("users service listening on %s", addr)
+		logger.Info("http server listening", slog.String("addr", addr))
 		if err := e.Start(addr); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("server error: %v", err)
+			logger.Error("server failed", slog.String("error", err.Error()))
+			os.Exit(1)
 		}
 	}()
 
-	// Фактор 9 (Disposability): корректное завершение по сигналу.
-	//
-	// Kubernetes при удалении пода шлёт SIGTERM и ждёт
-	// terminationGracePeriodSeconds, потом SIGKILL. Если приложение
-	// игнорирует SIGTERM, каждый деплой рвёт запросы «на лету» —
-	// клиенты видят 502. Здесь мы перестаём принимать новые соединения
-	// и даём текущим запросам доработать.
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	log.Println("shutdown signal received")
+	// Фактор 9: корректное завершение по SIGTERM.
+	sigCtx, stop := common.SignalContext()
+	defer stop()
+	<-sigCtx.Done()
+	logger.Info("shutdown signal received")
 
-	shutdownCtx, cancel := context.WithTimeout(ctx, cfg.ShutdownTimeout)
+	shutdownCtx, cancel := common.ShutdownContext(cfg.ShutdownTimeout)
 	defer cancel()
 	if err := e.Shutdown(shutdownCtx); err != nil {
-		log.Printf("graceful shutdown failed: %v", err)
+		logger.Error("graceful shutdown failed", slog.String("error", err.Error()))
 	}
-	log.Println("stopped")
+	logger.Info("stopped")
 }

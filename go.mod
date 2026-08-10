@@ -3,6 +3,7 @@ module github.com/Ivanvnew75/users
 go 1.26.5
 
 require (
+	github.com/Ivanvnew75/libs v0.2.1
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/labstack/echo/v4 v4.15.4
 )
