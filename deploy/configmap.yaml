@@ -1,0 +1,30 @@
+---
+# Несекретная часть конфигурации (Фактор 3).
+#
+# Почему ConfigMap отдельно от Secret, хотя технически можно всё в Secret:
+#  * ConfigMap видно в `kubectl get cm -o yaml` без опаски — это удобно
+#    при разборе инцидента;
+#  * права RBAC на Secret обычно уже, чем на ConfigMap, и не стоит
+#    заставлять дежурного просить доступ к секретам, чтобы посмотреть
+#    уровень логирования;
+#  * при подключении внешнего хранилища секретов (Vault/ESO) переезжает
+#    только Secret, а ConfigMap остаётся в git.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: users-config
+  namespace: moodbot
+  labels:
+    app.kubernetes.io/name: users
+    app.kubernetes.io/part-of: moodbot
+data:
+  SERVER_PORT: "8080"
+  LOG_LEVEL: "info"
+  LOG_FORMAT: "json"
+  # Размер пула на ОДНУ реплику. При replicas=2 суммарно 2×5=10 соединений
+  # к Postgres — держим в голове его max_connections=100.
+  DB_MAX_CONNS: "5"
+  # Меньше terminationGracePeriodSeconds (30), иначе приложение не успеет
+  # завершиться само и его добьёт SIGKILL — весь смысл graceful shutdown
+  # пропадёт. Правило: shutdown timeout < grace period.
+  SHUTDOWN_TIMEOUT: "15s"

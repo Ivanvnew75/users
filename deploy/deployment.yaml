@@ -1,0 +1,152 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: users
+  namespace: moodbot
+  labels:
+    app.kubernetes.io/name: users
+    app.kubernetes.io/part-of: moodbot
+    app.kubernetes.io/component: api
+spec:
+  # Deployment, а не StatefulSet — потому что сервис stateless (Фактор 6):
+  # всё состояние в Postgres, поды взаимозаменяемы, порядок их запуска
+  # не имеет значения.
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: users
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # maxUnavailable: 0 — во время выкатки не уменьшаем количество
+      # работающих подов ниже replicas. Сначала поднимается новый и проходит
+      # readiness, только потом гасится старый. Это и есть «деплой без
+      # даунтайма»; при maxUnavailable: 1 и двух репликах половина мощности
+      # уходит в момент выкатки.
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: users
+        app.kubernetes.io/part-of: moodbot
+        app.kubernetes.io/component: api
+    spec:
+      # Фактор 9 (Disposability): сколько ждать после SIGTERM до SIGKILL.
+      terminationGracePeriodSeconds: 30
+
+      # Разносим реплики по разным узлам. Preferred, а не required:
+      # на однонодовом кластере required заблокировал бы вторую реплику
+      # навсегда в Pending. Мягкое правило работает и там, и там.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: users
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: users
+          image: ghcr.io/ivanvnew75/users:0.1.0
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+
+          # envFrom для «пачки» переменных + отдельный env для секрета.
+          # Так контракт с окружением виден целиком в одном месте.
+          envFrom:
+            - configMapRef:
+                name: users-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: users-db
+                  key: database-url
+            # Downward API: под сообщает сам себе, кто он. Пригодится
+            # в логах (Фактор 11), чтобы отличать реплики.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+
+          # Три пробы, и у каждой своя работа — это то, что чаще всего
+          # путают:
+          #
+          #  startup   — «сервис ещё запускается, не трогай его».
+          #              Пока она не прошла, liveness и readiness не работают.
+          #              Без неё приходится завышать initialDelaySeconds
+          #              у liveness, и тогда реально зависший под живёт минуты.
+          #  readiness — «можно ли слать трафик». Ходит в базу.
+          #  liveness  — «жив ли процесс». В базу НЕ ходит (см. actions.go).
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30   # то есть до 60 секунд на старт
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # requests — то, по чему планировщик выбирает узел, и то, что
+          # реально резервируется. limits.memory обязателен (иначе утечка
+          # в одном поде выдавит соседей), а limits.cpu намеренно НЕ задан:
+          # CPU-лимит в Linux реализуется через cfs quota и приводит
+          # к троттлингу даже когда на узле есть свободный процессор —
+          # это классический источник «непонятных» задержек в p99.
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: users
+  namespace: moodbot
+  labels:
+    app.kubernetes.io/name: users
+    app.kubernetes.io/part-of: moodbot
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: users
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
