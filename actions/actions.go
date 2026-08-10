@@ -1,121 +1,201 @@
-// Package actions contains the HTTP handlers for the users microservice.
+// Package actions — HTTP-хендлеры микросервиса users.
 //
-// Хранилище здесь намеренно сделано заглушкой (in-memory map): по условию
-// задания реальных операций с базой данных пока нет — PgSQL появится позже.
+// Хендлеры получают *storage.Store через структуру Handler, а не через
+// глобальную переменную. Это не вкусовщина: глобальное состояние делает
+// сервис непроверяемым (в тесте не подсунуть другую базу) и незаметно
+// нарушает Фактор 6 (Processes) — глобалы соблазняют держать в них кэш,
+// а значит состояние, которое теряется при рестарте пода.
 package actions
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
-	"sync"
 
 	"github.com/labstack/echo/v4"
+
+	"github.com/Ivanvnew75/users/storage"
 )
 
-// User — модель пользователя микросервиса.
-type User struct {
-	ID    int    `json:"id"`
-	Name  string `json:"name"`
-	Email string `json:"email"`
+type Handler struct {
+	Store *storage.Store
 }
 
-// Заглушка вместо базы данных: map под мьютексом, т.к. Echo обрабатывает
-// запросы в отдельных горутинах.
-var (
-	mu     sync.RWMutex
-	users  = map[int]User{}
-	lastID int
-)
+func New(s *storage.Store) *Handler { return &Handler{Store: s} }
 
-// CreateUser — POST /users
-func CreateUser(c echo.Context) error {
-	u := new(User)
-	if err := c.Bind(u); err != nil {
+// Register вешает маршруты. Собрано в одном месте, чтобы список ручек
+// сервиса читался за пять секунд.
+func (h *Handler) Register(e *echo.Echo) {
+	e.GET("/health", h.Health)
+	e.GET("/ready", h.Ready)
+
+	e.POST("/users", h.CreateUser)
+	e.GET("/users", h.GetUsers)
+	e.GET("/users/:id", h.GetUser)
+	e.PUT("/users/:id", h.UpdateUser)
+	e.DELETE("/users/:id", h.DeleteUser)
+
+	e.GET("/users/by-telegram/:tgid", h.GetUserByTelegram)
+}
+
+// Health — liveness. Отвечает «процесс жив», НЕ ходит в базу.
+//
+// Это принципиально. Если liveness-проба проверяет базу, то короткая
+// недоступность Postgres превращается в перезапуск ВСЕХ подов приложения:
+// kubelet видит фейл пробы и убивает контейнеры. В результате к аварии базы
+// добавляется холодный старт всего приложения — авария усиливается вместо
+// того чтобы локализоваться. Правило: liveness проверяет только сам процесс.
+func (h *Handler) Health(c echo.Context) error {
+	return c.JSON(http.StatusOK, echo.Map{"status": "ok"})
+}
+
+// Ready — readiness. Вот здесь база проверяется.
+//
+// Смысл readiness другой: «можно ли слать мне трафик». Если база недоступна,
+// под honestly отвечает 503, Service убирает его из endpoints, балансировщик
+// перестаёт слать запросы — но под НЕ перезапускается и сам вернётся в строй,
+// когда база поднимется.
+func (h *Handler) Ready(c echo.Context) error {
+	if err := h.Store.Ping(c.Request().Context()); err != nil {
+		return c.JSON(http.StatusServiceUnavailable, echo.Map{
+			"status": "unavailable",
+			"reason": "database is not reachable",
+		})
+	}
+	return c.JSON(http.StatusOK, echo.Map{"status": "ready"})
+}
+
+type userInput struct {
+	TelegramID *int64 `json:"telegram_id"`
+	Name       string `json:"name"`
+	Email      string `json:"email"`
+}
+
+func (h *Handler) CreateUser(c echo.Context) error {
+	var in userInput
+	if err := c.Bind(&in); err != nil {
 		return c.JSON(http.StatusBadRequest, echo.Map{"error": "invalid request body"})
 	}
+	if in.Name == "" {
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": "name is required"})
+	}
 
-	mu.Lock()
-	lastID++
-	u.ID = lastID
-	users[u.ID] = *u
-	mu.Unlock()
-
+	// c.Request().Context() — контекст запроса, а не context.Background().
+	// Если клиент отвалился, запрос к базе будет отменён и не будет
+	// занимать соединение из пула впустую.
+	u, err := h.Store.Create(c.Request().Context(), storage.User{
+		TelegramID: in.TelegramID, Name: in.Name, Email: in.Email,
+	})
+	if err != nil {
+		return h.mapError(c, err)
+	}
 	return c.JSON(http.StatusCreated, u)
 }
 
-// GetUsers — GET /users
-func GetUsers(c echo.Context) error {
-	mu.RLock()
-	list := make([]User, 0, len(users))
-	for _, u := range users {
-		list = append(list, u)
+func (h *Handler) GetUsers(c echo.Context) error {
+	limit := intQuery(c, "limit", 50)
+	if limit <= 0 || limit > 500 {
+		limit = 50
 	}
-	mu.RUnlock()
+	offset := intQuery(c, "offset", 0)
+	if offset < 0 {
+		offset = 0
+	}
 
+	list, err := h.Store.List(c.Request().Context(), limit, offset)
+	if err != nil {
+		return h.mapError(c, err)
+	}
 	return c.JSON(http.StatusOK, list)
 }
 
-// GetUser — GET /users/:id
-func GetUser(c echo.Context) error {
-	id, err := strconv.Atoi(c.Param("id"))
+func (h *Handler) GetUser(c echo.Context) error {
+	id, err := pathID(c, "id")
 	if err != nil {
-		return c.JSON(http.StatusBadRequest, echo.Map{"error": "id must be an integer"})
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": err.Error()})
 	}
-
-	mu.RLock()
-	u, ok := users[id]
-	mu.RUnlock()
-
-	if !ok {
-		return c.JSON(http.StatusNotFound, echo.Map{"error": "user not found"})
+	u, err := h.Store.Get(c.Request().Context(), id)
+	if err != nil {
+		return h.mapError(c, err)
 	}
 	return c.JSON(http.StatusOK, u)
 }
 
-// UpdateUser — PUT /users/:id
-func UpdateUser(c echo.Context) error {
-	id, err := strconv.Atoi(c.Param("id"))
+func (h *Handler) GetUserByTelegram(c echo.Context) error {
+	id, err := pathID(c, "tgid")
 	if err != nil {
-		return c.JSON(http.StatusBadRequest, echo.Map{"error": "id must be an integer"})
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": err.Error()})
 	}
+	u, err := h.Store.GetByTelegramID(c.Request().Context(), id)
+	if err != nil {
+		return h.mapError(c, err)
+	}
+	return c.JSON(http.StatusOK, u)
+}
 
-	in := new(User)
-	if err := c.Bind(in); err != nil {
+func (h *Handler) UpdateUser(c echo.Context) error {
+	id, err := pathID(c, "id")
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": err.Error()})
+	}
+	var in userInput
+	if err := c.Bind(&in); err != nil {
 		return c.JSON(http.StatusBadRequest, echo.Map{"error": "invalid request body"})
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	if _, ok := users[id]; !ok {
-		return c.JSON(http.StatusNotFound, echo.Map{"error": "user not found"})
+	u, err := h.Store.Update(c.Request().Context(), id, storage.User{
+		TelegramID: in.TelegramID, Name: in.Name, Email: in.Email,
+	})
+	if err != nil {
+		return h.mapError(c, err)
 	}
-
-	in.ID = id
-	users[id] = *in
-
-	return c.JSON(http.StatusOK, in)
+	return c.JSON(http.StatusOK, u)
 }
 
-// DeleteUser — DELETE /users/:id
-func DeleteUser(c echo.Context) error {
-	id, err := strconv.Atoi(c.Param("id"))
+func (h *Handler) DeleteUser(c echo.Context) error {
+	id, err := pathID(c, "id")
 	if err != nil {
-		return c.JSON(http.StatusBadRequest, echo.Map{"error": "id must be an integer"})
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": err.Error()})
 	}
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	if _, ok := users[id]; !ok {
-		return c.JSON(http.StatusNotFound, echo.Map{"error": "user not found"})
+	if err := h.Store.Delete(c.Request().Context(), id); err != nil {
+		return h.mapError(c, err)
 	}
-	delete(users, id)
-
 	return c.NoContent(http.StatusNoContent)
 }
 
-// Health — GET /health, понадобится для проб Kubernetes.
-func Health(c echo.Context) error {
-	return c.JSON(http.StatusOK, echo.Map{"status": "ok"})
+// mapError — единственное место, где доменные ошибки превращаются в HTTP-коды.
+//
+// Отдельно: наружу НЕ отдаётся текст ошибки базы. Сообщения Postgres содержат
+// имена таблиц, колонок и иногда значения — это подсказка для атакующего
+// и утечка внутреннего устройства. Детали уходят в лог, клиент получает 500.
+func (h *Handler) mapError(c echo.Context, err error) error {
+	switch {
+	case errors.Is(err, storage.ErrNotFound):
+		return c.JSON(http.StatusNotFound, echo.Map{"error": "user not found"})
+	case errors.Is(err, storage.ErrConflict):
+		return c.JSON(http.StatusConflict, echo.Map{"error": "user already exists"})
+	default:
+		c.Logger().Errorf("storage error: %v", err)
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "internal error"})
+	}
+}
+
+func pathID(c echo.Context, param string) (int64, error) {
+	id, err := strconv.ParseInt(c.Param(param), 10, 64)
+	if err != nil {
+		return 0, errors.New(param + " must be an integer")
+	}
+	return id, nil
+}
+
+func intQuery(c echo.Context, name string, def int) int {
+	v := c.QueryParam(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
 }
