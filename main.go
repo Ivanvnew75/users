@@ -100,11 +100,15 @@ func main() {
 	//   RequestLogger      — залогировать запрос уже с этим идентификатором,
 	//   Recover            — поймать панику ВНУТРИ логируемого участка,
 	//                        иначе паника не попадёт в лог запроса.
+	metrics := common.NewMetrics("users")
+
 	e.Use(common.RequestID())
 	e.Use(common.PropagateRequestID())
+	e.Use(metrics.Middleware())
 	e.Use(common.RequestLogger(logger))
 	e.Use(middleware.Recover())
 
+	metrics.Register(e)
 	actions.New(store, logger).Register(e)
 
 	go func() {
