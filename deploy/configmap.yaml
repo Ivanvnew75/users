@@ -19,7 +19,7 @@ metadata:
     app.kubernetes.io/part-of: moodbot
 data:
   SERVER_PORT: "8080"
-  LOG_LEVEL: "info"
+  LOG_LEVEL: "debug"
   LOG_FORMAT: "json"
   # Размер пула на ОДНУ реплику. При replicas=2 суммарно 2×5=10 соединений
   # к Postgres — держим в голове его max_connections=100.
