@@ -177,8 +177,11 @@ func wrapPGError(err error) error {
 		// 23505 = unique_violation. Коды SQLSTATE стабильны и переносимы
 		// между версиями Postgres — в отличие от текста сообщения,
 		// который зависит от локали сервера.
-		if pgErr.Code == "23505" {
+		switch pgErr.Code {
+		case "23505": // unique_violation
 			return fmt.Errorf("%w: %s", ErrConflict, pgErr.ConstraintName)
+		case "23503": // foreign_key_violation — ссылка на несуществующего юзера
+			return fmt.Errorf("%w: %s", ErrNotFound, pgErr.ConstraintName)
 		}
 	}
 	return err

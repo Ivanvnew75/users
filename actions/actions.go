@@ -36,6 +36,13 @@ func (h *Handler) Register(e *echo.Echo) {
 	e.DELETE("/users/:id", h.DeleteUser)
 
 	e.GET("/users/by-telegram/:tgid", h.GetUserByTelegram)
+
+	// Ответы пользователя вложены в его ресурс — /users/:id/answers.
+	// Это не украшательство URL: вложенность отражает владение. Ответ
+	// не существует без пользователя (внешний ключ с CASCADE), и адрес
+	// это показывает.
+	e.POST("/users/:id/answers", h.CreateAnswer)
+	e.GET("/users/:id/answers", h.ListAnswers)
 }
 
 // Health — liveness. Отвечает «процесс жив», НЕ ходит в базу.
