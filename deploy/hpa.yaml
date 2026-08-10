@@ -1,0 +1,66 @@
+---
+# Горизонтальное автомасштабирование (Фактор 8).
+#
+# Фактор 8 в оригинале — «scale out, not up»: расти числом процессов,
+# а не размером одного. Причина не в моде на микросервисы, а в физике:
+# вертикальный рост упирается в размер самой большой машины и не даёт
+# отказоустойчивости — одна машина остаётся одной точкой отказа.
+#
+# ВАЖНАЯ ЛОВУШКА, из-за которой HPA «не работает»:
+# в deployment.yaml поля `replicas` быть НЕ ДОЛЖНО.
+# Если оно там есть, каждый `kubectl apply` возвращает число реплик
+# к записанному в манифесте, отменяя решение HPA. Выглядит это так:
+# «HPA отмасштабировал до 6, через минуту снова 2, и никто не понимает
+# почему» — а это просто отработал GitOps-повторный apply.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: users
+  namespace: moodbot
+  labels:
+    app.kubernetes.io/name: users
+    app.kubernetes.io/part-of: moodbot
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: users
+  minReplicas: 2
+  maxReplicas: 8
+
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # Проценты считаются ОТ requests, а не от лимита и не от ядра узла.
+          # requests.cpu = 25m, значит 60% = 15m на под. Это надо помнить:
+          # занизишь requests — HPA будет масштабировать от любого чиха.
+          averageUtilization: 60
+
+  behavior:
+    scaleUp:
+      # 0 секунд стабилизации: расти надо быстро, нагрузка уже пришла.
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100        # удваиваем
+          periodSeconds: 15
+        - type: Pods
+          value: 4          # но не больше +4 подов за раз
+          periodSeconds: 15
+      selectPolicy: Max
+    scaleDown:
+      # А вот вниз — медленно. 5 минут наблюдения перед сокращением.
+      #
+      # Асимметрия намеренная: ошибка «подержали лишние поды пять минут»
+      # стоит копейки, ошибка «сократились на спаде и не выдержали
+      # следующий всплеск» стоит отказа обслуживания. Без окна
+      # стабилизации получается flapping — поды прыгают вверх-вниз
+      # на каждом колебании нагрузки.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60

@@ -1,0 +1,34 @@
+---
+# PodDisruptionBudget — вторая половина Фактора 9.
+#
+# Graceful shutdown защищает от ОДНОГО уезжающего пода. PDB защищает
+# от ситуации, когда кластер решит увезти сразу все.
+#
+# Добровольные нарушения (voluntary disruptions) — это `kubectl drain`
+# при обслуживании узла, обновление узлов в managed-кластере,
+# работа cluster-autoscaler'а. Без PDB drain выселит все реплики сервиса
+# с узла одновременно, и приложение ляжет — при том, что каждый под
+# завершится идеально корректно.
+#
+# minAvailable, а не maxUnavailable: при работе с HPA число реплик
+# меняется, и «не больше одного недоступного» из 8 подов — это совсем
+# не то же самое, что из 2. minAvailable: 1 гарантирует, что хотя бы
+# кто-то остаётся, независимо от текущего масштаба.
+#
+# Важное ограничение, которое стоит знать: PDB НЕ защищает от
+# недобровольных нарушений — падения узла, OOM, вытеснения по нехватке
+# ресурсов. Это не «гарантия доступности», а «ограничение на то,
+# что кластер делает намеренно».
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: users
+  namespace: moodbot
+  labels:
+    app.kubernetes.io/name: users
+    app.kubernetes.io/part-of: moodbot
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: users

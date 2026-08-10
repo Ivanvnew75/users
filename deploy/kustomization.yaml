@@ -18,6 +18,8 @@ namespace: moodbot
 resources:
   - configmap.yaml
   - deployment.yaml
+  - hpa.yaml
+  - pdb.yaml
 
 # Блока `images:` здесь намеренно нет.
 #
