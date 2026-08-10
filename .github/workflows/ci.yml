@@ -1,0 +1,107 @@
+name: CI
+
+# CI гоняется на pull request и на push в main.
+#
+# Зачем и там, и там: PR проверяет изменение ДО слияния, push в main —
+# результат слияния. Это не дубль: merge двух зелёных веток может дать
+# красный main (semantic conflict), и ловится это только проверкой после
+# слияния.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Право только на чтение. Токен GITHUB_TOKEN по умолчанию получает широкие
+# права; сузить их до нужного минимума — самая дешёвая мера безопасности
+# в GitHub Actions. CI ничего не публикует, значит ему хватит contents: read.
+permissions:
+  contents: read
+
+# Отменяем предыдущий запуск для той же ветки, если пришёл новый пуш.
+# Без этого очередь забивается прогонами для уже неактуального кода.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Версия Go берётся из go.mod, а не пишется здесь руками.
+          # Иначе рано или поздно go.mod и CI разъедутся, и сборка
+          # в CI будет отличаться от локальной — прямое нарушение
+          # Фактора 10 (dev/prod parity).
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        # gofmt -l печатает файлы, которые НЕ отформатированы, и всегда
+        # выходит с кодом 0. Поэтому проверку приходится делать явно:
+        # непустой вывод = ошибка.
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Не отформатированы gofmt:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+  test:
+    runs-on: ubuntu-latest
+    # Service container с той же версией Postgres, что в кластере.
+    #
+    # Это Фактор 10 в чистом виде: тесты гоняются не против мока и не против
+    # SQLite, а против PostgreSQL 17 — того же движка и той же мажорной
+    # версии, что в проде. Иначе «зелёный CI» ничего не гарантирует.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: users_test
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        # Без health-check job начнёт тесты раньше, чем база примет
+        # соединения, и упадёт с «connection refused» — самая частая
+        # причина «мигающих» тестов в CI.
+        options: >-
+          --health-cmd "pg_isready -U test -d users_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Накатить миграции
+        # Те же самые файлы миграций, что уедут в прод. Не «примерная схема
+        # для тестов» — иначе тесты проверяют схему, которой нигде нет.
+        run: |
+          for f in migrations/*.up.sql; do
+            echo ">>> $f"
+            PGPASSWORD=test psql -h localhost -U test -d users_test -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - name: go test
+        env:
+          TEST_DATABASE_URL: postgres://test:test@localhost:5432/users_test?sslmode=disable
+        # -race включает детектор гонок. Для сетевого сервиса на Go это
+        # обязательный флаг в CI: гонки в горутинах не воспроизводятся
+        # стабильно и в проде выглядят как «иногда отдаёт мусор».
+        # -count=1 отключает кэш результатов тестов — иначе интеграционные
+        # тесты могут «пройти» из кэша, не тронув базу.
+        run: go test -race -count=1 -v ./...
