@@ -150,6 +150,22 @@ jobs:
 
           kubectl kustomize release/overlay > release/manifests.yaml
 
+          # Второй артефакт — миграционный Job с ТЕМ ЖЕ digest.
+          # Отдельным файлом, потому что стадия run обязана применить
+          # его РАНЬШЕ кода и дождаться завершения (Фактор 12).
+          mkdir -p release/migrate-overlay
+          cat > release/migrate-overlay/kustomization.yaml <<EOF
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          resources:
+            - ../../deploy/migrate
+          images:
+            - name: ghcr.io/ivanvnew75/users
+              digest: ${DIGEST}
+          EOF
+
+          kubectl kustomize release/migrate-overlay > release/migrate-job.yaml
+
           # Метаданные релиза: по ним потом можно ответить
           # «что именно сейчас работает и из какого коммита собрано».
           cat > release/RELEASE <<EOF
@@ -161,8 +177,8 @@ jobs:
           EOF
 
           echo "=== RELEASE ==="; cat release/RELEASE
-          echo "=== образ в манифесте ==="
-          grep -n "image:" release/manifests.yaml
+          echo "=== образ в манифестах (обязан совпадать) ==="
+          grep -hn "image:" release/manifests.yaml release/migrate-job.yaml
 
       - name: Опубликовать артефакт релиза
         uses: actions/upload-artifact@v4
@@ -197,6 +213,47 @@ jobs:
           set -euo pipefail
           kubectl config use-context kind-devopstrain
 
+          # ─── ШАГ 1: миграции (Фактор 12) ───
+          #
+          # Строго ДО выкатки кода. Если миграция упадёт, старый код
+          # останется работать на старой схеме — это рабочее состояние.
+          # Обратный порядок дал бы новый код на старой схеме, то есть
+          # пятисотки в проде.
+          #
+          # Удаляем предыдущий Job: спецификация Job неизменяема,
+          # повторный apply того же имени падает с ошибкой про immutable
+          # поля. --wait, чтобы не нарваться на гонку с созданием нового.
+          kubectl -n moodbot delete job users-migrate --ignore-not-found --wait=true
+          kubectl apply -f release/migrate-job.yaml
+
+          # Ждём исхода опросом, а не `kubectl wait --for=condition=complete`.
+          #
+          # Причина: одиночный wait на "complete" при упавшей миграции
+          # будет честно ждать все 300 секунд, хотя ответ известен через 10.
+          # Опрос различает ОБА терминальных состояния сразу.
+          echo "жду завершения миграции..."
+          for i in $(seq 1 150); do
+            COMPLETE=$(kubectl -n moodbot get job users-migrate \
+              -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)
+            FAILED=$(kubectl -n moodbot get job users-migrate \
+              -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)
+            [ "$COMPLETE" = "True" ] && break
+            [ "$FAILED" = "True" ] && break
+            sleep 2
+          done
+
+          echo "--- лог миграции ---"
+          kubectl -n moodbot logs job/users-migrate --tail=50 || true
+
+          if [ "$COMPLETE" != "True" ]; then
+            echo "МИГРАЦИЯ НЕ УДАЛАСЬ — код не выкатываем"
+            kubectl -n moodbot describe job users-migrate | tail -20
+            exit 1
+          fi
+          echo "миграция успешна, выкатываю код"
+
+          # ─── ШАГ 2: код ───
+          #
           # Стадия run НИЧЕГО не собирает и не рендерит — она применяет
           # готовый артефакт. Если бы здесь был `kustomize build`,
           # результат зависел бы от состояния файлов на раннере,

@@ -1,0 +1,22 @@
+---
+# Job вынесен в ОТДЕЛЬНЫЙ оверлей, а не лежит рядом с Deployment.
+#
+# Причина — порядок. `kubectl apply -f manifests.yaml` применяет всё
+# одновременно и ничего не гарантирует: Deployment может начать выкатку
+# раньше, чем миграция закончится, и новый код увидит старую схему.
+#
+# Разделив артефакты, стадия run в CI получает возможность выполнить
+# их последовательно: сначала Job, дождаться завершения, потом код.
+# Это тот случай, когда «просто применить весь каталог» — неправильно.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: moodbot
+
+resources:
+  - job.yaml
+
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/managed-by: kustomize

@@ -1,0 +1,103 @@
+---
+# Миграции как разовая задача Kubernetes (Фактор 12).
+#
+# ПОЧЕМУ НЕ АВТОМИГРАЦИЯ ПРИ СТАРТЕ ПРИЛОЖЕНИЯ
+#
+# Соблазн большой: добавил runMigrations() в main() — и забыл. Так делают,
+# и вот что при этом ломается:
+#
+#  1. ГОНКА. Реплик N. При выкатке все стартуют одновременно и все лезут
+#     мигрировать. Без блокировки — взаимные дедлоки и половинчатая схема.
+#     (Advisory lock в migrate.go эту конкретную беду закрывает, но
+#     остальные — нет.)
+#  2. ДОЛГАЯ МИГРАЦИЯ ЛОМАЕТ ВЫКАТКУ. Миграция на десять минут означает,
+#     что под десять минут не отвечает на пробы. startupProbe его убьёт,
+#     kubelet перезапустит, миграция начнётся заново — бесконечный цикл.
+#  3. НЕТ ТОЧКИ ОСТАНОВКИ. Если миграция упала, приложение уже частично
+#     выкачено. Отделённая задача позволяет остановиться ДО выкатки кода.
+#  4. НЕПОНЯТНО, ЧТО ПРОИЗОШЛО. Логи миграции перемешаны с логами запросов
+#     сотни подов. У Job — свой лог и свой статус.
+#
+# Правильный порядок в конвейере: migrate → дождаться успеха → выкатить код.
+# Именно так это сделано в .github/workflows/release.yml, стадия run.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: users-migrate
+  namespace: moodbot
+  labels:
+    app.kubernetes.io/name: users
+    app.kubernetes.io/component: migrate
+    app.kubernetes.io/part-of: moodbot
+spec:
+  # backoffLimit: 3 — три попытки. Ноль был бы слишком строго (миграция
+  # может не подключиться к базе из-за секундной сетевой заминки),
+  # а дефолтные 6 — слишком долго ждать очевидного провала.
+  backoffLimit: 3
+
+  # Job удалится через 10 минут после завершения вместе со своим подом.
+  #
+  # Без этого в кластере копятся сотни Completed-задач. Хуже того:
+  # Job'ы неизменяемы, и повторный `kubectl apply` того же имени
+  # падает с ошибкой про immutable field — выкатка ломается на ровном месте.
+  ttlSecondsAfterFinished: 600
+
+  # activeDeadlineSeconds — жёсткий предел на всю задачу.
+  # Зависшая миграция, держащая блокировку, страшнее упавшей:
+  # она блокирует и следующие выкатки тоже.
+  activeDeadlineSeconds: 600
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: users
+        app.kubernetes.io/component: migrate
+    spec:
+      # Never, а не OnFailure: перезапуском занимается сам Job
+      # (создавая новый под), и это видно в его статусе. При OnFailure
+      # контейнер перезапускается внутри того же пода, и количество
+      # попыток отследить труднее.
+      restartPolicy: Never
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: migrate
+          # ТОТ ЖЕ ОБРАЗ, что у сервиса. В CI сюда подставляется
+          # тот же digest — это и есть «идентичное окружение»
+          # из формулировки Фактора 12.
+          image: ghcr.io/ivanvnew75/users:0.1.0
+          imagePullPolicy: IfNotPresent
+
+          # Подкоманда того же бинарника. Не отдельный образ с psql,
+          # не скрипт из ConfigMap — тот же код, та же версия драйвера,
+          # те же встроенные .sql-файлы.
+          args: ["migrate"]
+
+          # ТА ЖЕ конфигурация, что у сервиса: те же ConfigMap и Secret.
+          # Если бы миграция ходила в базу под другим пользователем
+          # или другим адресом, «идентичность окружения» была бы фикцией.
+          envFrom:
+            - configMapRef:
+                name: users-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: users-db
+                  key: database-url
+
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

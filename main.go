@@ -47,9 +47,41 @@ func main() {
 	// Иначе в контейнере снова окажется два формата.
 	slog.SetDefault(logger)
 
-	logger.Info("starting", slog.String("commit", commit))
-
 	ctx := context.Background()
+
+	// Подкоманды — Фактор 12 (Admin processes).
+	//
+	// Один бинарник, один образ, одна конфигурация, три режима запуска:
+	//   users            — долгоживущий процесс (обычный запуск);
+	//   users migrate    — разовая задача: накатить миграции;
+	//   users admin ...  — разовая задача: посмотреть данные.
+	//
+	// Разовые задачи ОБЯЗАНЫ запускаться из того же релиза, что и сервис.
+	// Отдельный «скрипт для миграций» неизбежно отстаёт от кода и однажды
+	// накатывает не то, что ожидает приложение.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "migrate":
+			if err := runMigrations(ctx, cfg.DatabaseURL, logger); err != nil {
+				logger.Error("migrations failed", slog.String("error", err.Error()))
+				os.Exit(1)
+			}
+			return
+		case "admin":
+			if err := runAdmin(ctx, cfg.DatabaseURL, os.Args[2:]); err != nil {
+				logger.Error("admin command failed", slog.String("error", err.Error()))
+				os.Exit(1)
+			}
+			return
+		default:
+			logger.Error("неизвестная подкоманда",
+				slog.String("arg", os.Args[1]),
+				slog.String("hint", "доступны: migrate, admin"))
+			os.Exit(2)
+		}
+	}
+
+	logger.Info("starting", slog.String("commit", commit))
 
 	store, err := storage.New(ctx, cfg.DatabaseURL, cfg.DBMaxConns)
 	if err != nil {
