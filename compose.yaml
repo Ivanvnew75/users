@@ -1,0 +1,118 @@
+# Локальная разработка сервиса users.
+#
+# ФАКТОР 10 (Dev/prod parity) — про сокращение трёх разрывов:
+#
+#   разрыв во времени   — от написания кода до прода часы, а не месяцы;
+#   разрыв в людях      — кто написал, тот и выкатил;
+#   разрыв в инструментах — ЛОКАЛЬНО РАБОТАЮТ ТЕ ЖЕ БЭКЕНДЫ, ЧТО В ПРОДЕ.
+#
+# Этот файл закрывает третий. Соблазн, которому здесь сказано «нет»:
+# «для локальной разработки хватит SQLite / in-memory, зачем поднимать
+# Postgres». Хватит ровно до первого расхождения — а расходятся они
+# в транзакциях, блокировках, типах, NULL-семантике и сортировке,
+# то есть в том, что находят только в проде.
+#
+# Запуск:  docker compose up -d
+# Логи:    docker compose logs -f users
+# Снести:  docker compose down -v
+
+services:
+  postgres:
+    # ТА ЖЕ версия и ТОТ ЖЕ образ, что в кластере (infra/10-postgres.yaml)
+    # и в CI (.github/workflows/ci.yml). Три места, где версия должна
+    # совпадать; расхождение проверяет scripts/check-parity.sh.
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-moodbot}
+      POSTGRES_USER: ${POSTGRES_USER:-moodbot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devpassword}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      # Локаль задана явно и совпадает с кластерной.
+      #
+      # От LC_COLLATE зависит порядок ORDER BY, а значит и то, какие
+      # строки попадут на какую страницу при LIMIT/OFFSET. Расхождение
+      # тихое: тесты зелёные, а пользователь видит дубли при листании.
+      #
+      # ВАЖНАЯ ЛОВУШКА, проверенная экспериментом.
+      # В alpine-образах Postgres (musl libc) локали фактически НЕ
+      # РЕАЛИЗОВАНЫ: initdb примет --locale=en_US.utf8 и запишет его
+      # в pg_database.datcollate, но сортировка останется байтовой.
+      # Проверка на 'apple','Banana','cherry':
+      #   postgres:17-alpine (musl),  datcollate=en_US.utf8 -> Banana, apple, cherry
+      #   postgres:17        (glibc), datcollate=en_US.utf8 -> apple, Banana, cherry
+      #
+      # То есть одинаковая версия и одинаковая объявленная локаль
+      # НЕ гарантируют одинаковое поведение — решает базовый образ.
+      # Отсюда правило: alpine и здесь, и в кластере, либо debian
+      # и здесь, и в кластере. Смешивать нельзя.
+      LANG: en_US.utf8
+      POSTGRES_INITDB_ARGS: "--locale=en_US.utf8"
+    ports:
+      # Наружу — нестандартный порт: 5432 на машине может быть занят
+      # системным Postgres, и тогда psql пойдёт не туда, куда думает
+      # разработчик. Внутри сети compose порт остаётся 5432.
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-moodbot} -d ${POSTGRES_DB:-moodbot}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  # Миграции — ОТДЕЛЬНЫЙ одноразовый контейнер, а не шаг внутри приложения.
+  #
+  # Это заранее подготовленный Фактор 12 (Admin processes): миграция —
+  # административная задача, она запускается в том же окружении и на том же
+  # релизе, но как отдельный процесс. В кластере ей соответствует Job.
+  migrate:
+    image: postgres:17-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-devpassword}
+    volumes:
+      - ./migrations:/migrations:ro
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        for f in /migrations/*.up.sql; do
+          echo ">>> $$f"
+          psql -h postgres -U ${POSTGRES_USER:-moodbot} -d ${POSTGRES_DB:-moodbot} -v ON_ERROR_STOP=1 -f "$$f"
+        done
+
+  users:
+    # build, а не готовый образ: локально проверяется ТОТ ЖЕ Dockerfile,
+    # который соберёт CI. Иначе «у меня собирается» и «в CI не собирается»
+    # становятся разными вопросами.
+    build:
+      context: .
+      args:
+        VERSION: dev
+        COMMIT: local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      # Те же имена переменных, что в ConfigMap/Secret кластера.
+      # Совпадение имён важнее совпадения значений: именно по ним
+      # разработчик понимает, что настраивать в проде.
+      DATABASE_URL: postgres://${POSTGRES_USER:-moodbot}:${POSTGRES_PASSWORD:-devpassword}@postgres:5432/${POSTGRES_DB:-moodbot}?sslmode=disable
+      SERVER_PORT: "8080"
+      LOG_LEVEL: ${LOG_LEVEL:-debug}
+      # text вместо json — единственное осознанное отличие от прода.
+      # Читать json глазами в терминале невозможно, а формат лога
+      # не влияет на поведение приложения.
+      LOG_FORMAT: text
+      DB_MAX_CONNS: "5"
+      SHUTDOWN_TIMEOUT: "15s"
+    ports:
+      - "18080:8080"
+    restart: unless-stopped
+
+volumes:
+  pgdata:

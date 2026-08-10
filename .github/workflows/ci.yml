@@ -54,6 +54,12 @@ jobs:
       - name: build
         run: go build ./...
 
+      # Фактор 10: версия backing service обязана совпадать в compose,
+      # в CI и в кластере. Договорённость «не забывать обновлять
+      # в трёх местах» не работает — нужна проверка.
+      - name: parity версий backing services
+        run: ./scripts/check-parity.sh
+
   test:
     runs-on: ubuntu-latest
     # Service container с той же версией Postgres, что в кластере.
