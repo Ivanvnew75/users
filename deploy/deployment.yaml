@@ -55,6 +55,12 @@ spec:
     spec:
       # Фактор 9 (Disposability): сколько ждать после SIGTERM до SIGKILL.
       terminationGracePeriodSeconds: 30
+      # Свой ServiceAccount и БЕЗ монтирования его токена.
+      # Сервис к API Kubernetes не обращается, значит токен ему не нужен;
+      # а лежащий в контейнере токен — это готовый ключ к API для того,
+      # кто добьётся выполнения кода. Курс Next Level, задание 16.
+      serviceAccountName: users
+      automountServiceAccountToken: false
 
       # Разносим реплики по разным узлам. Preferred, а не required:
       # на однонодовом кластере required заблокировал бы вторую реплику
